@@ -1,300 +1,208 @@
-const CommonsModel = require('../models/commons')
+const BaseModel = require("./baseModel");
 const utils = require('../config/utils');
-const CONST_VAL = require('../constants');
-const constants = require('../config/constants');
-const s3Services = require('../utils/s3Services');
-const EdroDashboardhModel = require('../models/edroDashboard');
-const { d3, moment, uuid, lodash } = require("../packages");
-//const utils = require('../libraries/datetimeLib')
-const date_moment = require('moment');
+const { convertArrayToString } = require('../utils');
+const moment = require('moment');
 
-const getEDROActivities = async (event) => {
+const {constants: {DATABASE: {RESEARCH_RESPONSE_DB}}} = require('../constants')
 
-    let authorizationResponse = utils.authorization(event);
-    console.log("auth status --", authorizationResponse);
-    if (authorizationResponse.statusCode != constants.statusCode.Succes) {
-        return authorizationResponse;
+
+/**
+ * Class representing a message model.
+ * @class
+ */
+class EdroDashboardModel extends BaseModel {
+    /**
+     * Constructor.
+     *
+     * @param  {Object}  opts
+     */
+    constructor( opts ) {
+        super( opts );
+        this._hasTimestamps = false;
+        this.clientId = opts.clientId;
     }
-    let clientId = (event.headers.clientid) ? event.headers.clientid : event.headers.clientId;
-    let studyId = event.pathParameters.studyid;
-    let s3ClientBucket = null;
-    let eDROActivities = [];
-    let response = {};
-    let analyticsDashboardEnabledActivities = [];
-    try {
-        const commonsModel = new CommonsModel({
-            clientId
-        });
-        const dbConnectionPool = await commonsModel._initDbConnectionPool(clientId, CONST_VAL.constants.DATABASE.RESEARCH_DB);
+
+    async getActivityResponseData(params) {
+
+        const dbConnectionPool = await this._initDbConnectionPool(this.clientId, RESEARCH_RESPONSE_DB);
+
         const bindingParams = []
-        bindingParams.push(studyId)
-        let querySql = `
-            select activity_id, activity_title 
-            from research.study_activity_meta_data
-            where study_id = ? `
-        const [studyActivities] = await dbConnectionPool.query(querySql, bindingParams)
-        console.log("studyActivity" + JSON.stringify(studyActivities))
-        if (studyActivities) {
-            const [clientData] = await dbConnectionPool.query(`select * from research.client_config cc where cc.id = ${clientId}`)
-            const clientConfig = clientData[0];
-            if (!clientConfig) {
-                throw new Error('Client config not found')
-            }
-            s3ClientBucket = clientConfig.s3_bucket;
-
-            const s3BucketExists = await s3Services.checkBucketExists(s3ClientBucket);
-            if (!s3BucketExists) {
-                throw new Error('Client S3 bucket not found.');
-            }
-
-            const [clientActivities] = await dbConnectionPool.query(`select * from research.client_activity`);
-            if (!clientActivities) {
-                throw new Error('Client activities not found')
-            }
-
-            for (let activity of clientActivities) {
-                console.log("activity " + JSON.stringify(activity))
-                const eDROActivityKey = CONST_VAL.constants.S3_STATIC_FOLDER.EDROs + '/' + activity.id + '.json'
-                console.log("eDROActivityKey " + JSON.stringify(eDROActivityKey))
-                const eDroActivityExists = await s3Services.doesObjectExists(eDROActivityKey, s3ClientBucket);
-                if (eDroActivityExists) {
-                    console.log('Fetching eDRO Activity Data - ', eDroActivityExists);
-                    const s3EDROActivity = await s3Services.readS3JSONObject(eDROActivityKey, s3ClientBucket);
-                    if (s3EDROActivity instanceof Error) {
-                        console.log('Error fetching eDRO Activity Data for - ', eDROActivityKey);
-                        continue;
-                    }
-                    const eDROActivity = JSON.parse(s3EDROActivity)
-                    if (eDROActivity.eDRODashboardEnabled && eDROActivity.eDRODashboardEnabled === true) {
-                    console.log("S3 eDROActivity" + JSON.stringify(eDROActivity))
-                    analyticsDashboardEnabledActivities.push(eDROActivity.id);
-                     }
-
-                }
-            }
-            console.log("analyticsDashboardEnabledActivities" + JSON.stringify(analyticsDashboardEnabledActivities))
-            for (let studyActivity of studyActivities) {
-                const studyActivityKey = 'studies/' + studyId + '/' + 'activities' + '/' + studyActivity.activity_id + '.json'
-
-                const studyActivityExists = await s3Services.doesObjectExists(studyActivityKey, s3ClientBucket);
-                if (studyActivityExists) {
-                    const activityS3Obj = await s3Services.readS3JSONObject(studyActivityKey, s3ClientBucket);
-                    if (activityS3Obj instanceof Error) {
-                        console.log('Error fetching  Activity Data for - ', studyActivityKey);
-                        continue;
-                    }
-                    const activityData = JSON.parse(activityS3Obj)
-                    console.log("activityS3Obj " + JSON.stringify(activityData))
-                    if (analyticsDashboardEnabledActivities.includes(activityData.id)) {
-                    let responseActivity = {
-                        activityId: activityData.identifier,
-                        activityTitle: activityData.title,
-                        filters: activityData.dataCollected.sort()
-                    }
-                    eDROActivities.push(responseActivity);
-                    }
-                }
-            }
+        if (params.participantsIds) {
+            params.participantsIds = convertArrayToString(params.participantsIds);
         }
-    } catch
-        (error) {
-        console.log('Error in fetching eDRO Activities:', error);
-        throw error;
-    }
-    response.activities = eDROActivities;
-    return utils.success(constants.statusCode.Succes, constants.status.SUCCESS, response);
-}
-
-const getRecentData = async (params) => {
-    params.fromDate = params.fromDate ? `${params.fromDate} 00:00:00` : null;
-    params.toDate = params.toDate ? `${params.toDate} 23:59:59` : null;
-
-    let limit = 200;
-    let offset = 0;
-    if ( params.pageSize) {
-        limit = Number(params.pageSize);
-    }
-    if ( params.pageNum) {
-        offset = Number(params.pageNum);
-        if (offset > 0){
-            offset = offset * limit;
+        if (params.siteIds) {
+            params.siteIds = convertArrayToString(params.siteIds);
         }
-    }
-    params.limit = limit;
-    params.offset = offset;
-    params.sortValue = "start_time";
-    params.sortOrder = "DESC";
-    let response = [];
-    const {clientId} = params;
-    const eDRODashboardModel = new EdroDashboardhModel({clientId});
-    let queryData = [];
-    try {
-        queryData = await eDRODashboardModel.getActivityResponseData(params);
-    } catch (error) {
-        console.error(`Error in getRecentData`, error)
-        throw error;
-    }
-    for (let recordData of queryData) {
+        let limitParams=''
+        if(params.offset !=null && params.limit !=null){
+            limitParams= `LIMIT ${params.offset},${params.limit}`
+        }
+        let orderByParams=''
+        if (params.sortValue && params.sortOrder) {
+            orderByParams = `ORDER BY ${params.sortValue} ${params.sortOrder}`
+        }
+
+      let sqlQuery = `SELECT 
+                        ar.participant_id, 
+                        ar.response_data, 
+                        ar.end_time, 
+                        ar.start_time, 
+                        CASE WHEN pt.user_defined_participant_id is not null THEN pt.user_defined_participant_id else pt.id end AS participantId 
+                        from 
+                        research.participant pt 
+                        JOIN research_response.activity_response ar ON ar.participant_id = pt.id 
+                        WHERE 
+                        ar.study_id = '${params.studyId}'
+                        ${params.siteIds ? `AND ar.site_id IN (${params.siteIds}) ` : '' } 
+                        AND ar.activity_id = '${params.activityId}' 
+                        ${params.participantsIds ? `AND pt.id IN (${params.participantsIds}) ` : '' } 
+                        ${params.fromDate ? `and end_time BETWEEN '${params.fromDate}' AND '${params.toDate}'` : '' }
+                        ${orderByParams} 
+                        ${limitParams}`
+
+        
         try {
-            let readings = await recentDataForForcedSpirometry(recordData.response_data, recordData.participantId,recordData.start_time)
-            response.push(...readings)
+            console.log(`getRecentData query SQL ${JSON.stringify(params)} \n${sqlQuery}`);
+            const [data] = await dbConnectionPool.query(sqlQuery, bindingParams)
+            dbConnectionPool.end();
+            return data;
         } catch (error) {
-            console.error(`Error in processing records` + recordData, error)
-            continue;
+            dbConnectionPool.end();
+            console.log('Error in function getRecentData:', error);
+            throw error;
         }
     }
-    return utils.success(constants.statusCode.Succes, constants.status.SUCCESS, response);
-}
+    
+    async getExpectedData(params) {
+      const dbConnectionPool = await this._initDbConnectionPool(this.clientId,RESEARCH_RESPONSE_DB);
+      try {
+        if (params.participantsIds) {
+            params.participantsIds = convertArrayToString(params.participantsIds);
+           }
+        if (params.siteIds) {
+           params.siteIds = convertArrayToString(params.siteIds);
+          }
+        let querySql = `SELECT
+                        pt.start_date_utc,
+                        pt.study_id as study_id,
+                            CASE
+                                WHEN pt.user_defined_participant_id is not null
+                                    THEN pt.user_defined_participant_id
+                                else pt.id
+                                end   AS participantId,
+                                pt.id as participant_id,
+                            CASE
+                                WHEN exists(
+                                        SELECT (md.study_end_date)
+                                        FROM research.study_meta_data md
+                                        WHERE md.id = pt.study_id
+                                        ${(params.fromDate && params.toDate) ? `and  DATE_ADD(md.study_end_date, INTERVAL 1 DAY) between '${params.fromDate} 00:00:00' AND '${params.toDate} 23:59:59'` : 'and  DATE_ADD(md.study_end_date, INTERVAL 1 DAY)<=now()'}
+                                    ) THEN 'false'
+                                WHEN pt.status in ('WITHDRAWN', 'DISQUALIFIED', 'DISQUALIFY','WITHDRAWSTUDY', 'DISCONTINUED') THEN 'false'
+                                WHEN pt.status in ('ACTIVE') THEN 'true' END AS is_participant_active,
+                            (
+                                SELECT Max(ar1.end_time)
+                                FROM research_response.activity_response ar1
+                                WHERE ar1.participant_id = pt.id
+                                    ${(params.toDate) ? `and (case when ar1.end_time <= date_add('${params.toDate}',INTERVAL 1 DAY) then ar1.end_time else null end)` : ''}
+                                    and ar1.activity_id = '${params.activityId}'
+                            ) as most_recent_data,
+                            CASE WHEN pt.status in ( 'WITHDRAWN', 'DISQUALIFIED', 'DISQUALIFY','WITHDRAWSTUDY', 'DISCONTINUED')
+                                    THEN
+                                    (
+                                        SELECT DATE_ADD(
+                                                        pt1.start_date_utc, INTERVAL pts1.end_day DAY
+                                                    ) as discontinued_date
+                                        FROM research.participant pt1
+                                                    JOIN research_response.participant_task_schedule pts1 ON pts1.participant_id = pt1.id
+                                        WHERE pts1.participant_id = pts.participant_id
+                                            AND pts1.task_id = pts.task_id
+                                            ${(params.fromDate && params.toDate) ? `AND DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day DAY) between '${params.fromDate} 00:00:00' AND '${params.toDate} 23:59:59'` : 'AND DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day DAY)<=now()'}
+                                            AND DATE_ADD(
+                                                        pt1.start_date_utc, INTERVAL pts1.end_day DAY
+                                                    ) <= (
+                                                    select date(max(modified_time)) as discontinued_date
+                                                    from research.participant_status_history psh
+                                                    where new_status in ('DISQUALIFIED', 'WITHDRAWSTUDY') and psh.participant_id = pts.participant_id
+                                                )
+                                            AND NOT EXISTS(
+                                                SELECT ar2.task_instance_id
+                                                FROM research_response.activity_response ar2
+                                                WHERE ar2.participant_id = pts.participant_id
+                                                    AND ar2.task_instance_id = pts1.task_instance_id
+                                            )
+                                        ORDER BY discontinued_date desc limit 1
+                                    )
+                                ELSE
+                                    (
+                                        SELECT DATE_ADD(
+                                                        pt1.start_date_utc, INTERVAL pts1.end_day DAY
+                                                    ) as missed_date
+                                        FROM research.participant pt1
+                                                    JOIN research_response.participant_task_schedule pts1 ON pts1.participant_id = pt1.id
+                                        WHERE pts1.participant_id = pts.participant_id
+                                            AND pts1.task_id = pts.task_id
+                                            ${(params.fromDate && params.toDate) ? `AND DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day DAY) between '${params.fromDate} 00:00:00' AND '${params.toDate} 23:59:59'` : 'AND DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day DAY) <=now()'}
+                                            AND NOT EXISTS(
+                                                SELECT ar2.task_instance_id
+                                                FROM research_response.activity_response ar2
+                                                WHERE ar2.participant_id = pts.participant_id
+                                                    AND ar2.task_instance_id = pts1.task_instance_id
+                                            )
+                                        ORDER BY missed_date desc
+                                        limit 1
+                                    )
+                                END as expected_missing_date,
+                            (
+                                SELECT count(pt1.id)
+                                FROM research.participant pt1
+                                        JOIN research_response.participant_task_schedule pts1 ON pts1.participant_id = pt1.id
+                                WHERE pts1.participant_id = pts.participant_id
+                                    AND pts1.task_id = pts.task_id
+                                    AND IF(
+                                            pt.status in ('WITHDRAWN', 'DISQUALIFIED', 'DISQUALIFY', 'WITHDRAWSTUDY', 'DISCONTINUED'),
+                                            (DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day DAY) <= (
+                                                select date(max(modified_time)) as discontinued_date
+                                                from research.participant_status_history psh
+                                                where new_status in ('DISQUALIFIED', 'WITHDRAWSTUDY')
+                                                    and psh.participant_id = pts.participant_id
+                                            )${(params.fromDate && params.toDate) ? `AND DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day  DAY) between '${params.fromDate} 00:00:00' AND '${params.toDate} 23:59:59'),` : 'AND DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day  DAY) <=now()),'}
+                                            ${(params.fromDate && params.toDate) ? `DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day  DAY) between '${params.fromDate} 00:00:00' AND '${params.toDate} 23:59:59')` : 'DATE_ADD(pt1.start_date_utc, INTERVAL pts1.end_day  DAY)<=now())'}
+                                    AND NOT EXISTS(
+                                        SELECT ar2.task_instance_id
+                                        FROM research_response.activity_response ar2
+                                        WHERE ar2.participant_id = pts.participant_id
+                                            AND ar2.task_instance_id = pts1.task_instance_id
+                                    )
+                            )  days_missing
+                    FROM research.participant pt
+                    Right JOIN research_response.participant_task_schedule pts ON pts.participant_id = pt.id
+                    WHERE pt.study_id = '${params.studyId}'
+                        AND pts.task_id = '${params.activityId}'
+                        ${params.siteIds ? `AND pt.site_id IN (${params.siteIds}) ` : ''}
+                        ${params.participantsIds ? `AND pts.participant_id IN (${params.participantsIds}) ` : ''}              
+                        AND pt.start_date_utc <= ${(params.toDate) ? `Date('${params.toDate}')` : 'Date(now())'}
+                        AND pt.status in ('ACTIVE', 'WITHDRAWN', 'DISQUALIFIED','DISQUALIFY', 'WITHDRAWSTUDY', 'DISCONTINUED')
 
-function recentDataForForcedSpirometry(data, participantId,startDate) {
-
-    let recentData = []
-    startDate = moment(startDate).format("DD MMM YYYY T HH:mm:ss").toString().toUpperCase();
-    const eDROResponse = JSON.parse(data);
-    console.log('eDROResponse', eDROResponse)
-    const deviceName = eDROResponse['deviceName']
-    let fvc = eDROResponse['fvc'];
-    if (fvc) {
-        for (let i of fvc) {
-            let reading = i['reading']
-            let result = i['result']
-            let qualityKey = result['quality_key']
-            let qualityMessage = '';
-            if (qualityKey) {
-               qualityMessage = CONST_VAL.constants.SPIROMETER_QUALITY_MESSAGES[qualityKey] ? CONST_VAL.constants.SPIROMETER_QUALITY_MESSAGES[qualityKey] : '';
-            }
-            let attributes = result['attributes'];
-            let data = {
-                participantId,
-                deviceName,
-                reading,
-                qualityMessage,
-                startDate
-            }
-            for (let att of attributes) {
-                data[att.attribute.toLowerCase()] = att['value']
-                let unit = att.attribute + '_' + 'unit';
-                data[unit.toLowerCase()] = att['unit']
-            }
-            recentData.push(data)
-        }
-    }
-
-    return recentData
-}
-
-const getEdroActivitiesExpectedData = async (params) => {
-    utils.createLog('', `Begin getEdroActivitiesExpectedData`, params);
-    const { clientId } = params;
-     try {
-      const edroDashboardhModel = new EdroDashboardhModel({ clientId });
-      let queriesData = await edroDashboardhModel.getExpectedData(params);
-      if (queriesData) {
-          queriesData.map( querieData=> {
-          querieData.expected_missing_date= querieData.expected_missing_date ?  date_moment(querieData.expected_missing_date).format("DD MMM YYYY").toString().toUpperCase() : null;
-          querieData.most_recent_data= querieData.most_recent_data? date_moment(querieData.most_recent_data).format("DD MMM YYYY").toString().toUpperCase() :null;
-          if(querieData.user_defined_participant_id){
-             querieData.participantId = querieData.user_defined_participant_id;          
-            }
-            
-            delete querieData.discontinued_date;
-            delete querieData.start_date_utc;
-            delete querieData.participant_id;
-
-            delete querieData.user_defined_participant_id;
-            delete querieData.taskId;
-            delete querieData.study_id;
-          });
-        return queriesData
+                        ${(params.fromDate) ? `AND NOT EXISTS
+                        ( select modified_time as discontinued_date
+                                                    from research.participant_status_history psh
+                                                    where new_status in ('DISQUALIFIED', 'WITHDRAWSTUDY')
+                                                    and modified_time< Date('${params.fromDate}')
+                                                    and psh.participant_id = pt.id)` : ''}
+                    GROUP BY pts.participant_id
+                    ORDER BY expected_missing_date desc,most_recent_data desc, participantId asc `;
+       utils.createLog('',`getExpectedData query SQL ${JSON.stringify(params)}`,`${querySql}`);
+       const [data] = await dbConnectionPool.query(querySql);
+       dbConnectionPool.end();
+       return data;
+      } catch (error) {
+        dbConnectionPool.end();
+        utils.createLog('', `Error in function getExpectedData`, error);
+        throw error;
       }
-      else{
-         return [];
-      }
-     } catch (error) {
-      utils.createLog('', `Error in getEdroActivitiesExpectedData`, error);
-      throw error;
     }
-  };
 
-  const getDailyReadingData = async (params) => {
-    let response = {},queryData = [];
-    const { clientId } = params;
-    const eDRODashboardModel = new EdroDashboardhModel({ clientId });
-    try {
-      queryData = await eDRODashboardModel.getActivityResponseData(params);
-      response =  dailySpirometerReadingData(queryData, params);
-    } catch (error) {
-      console.error(`Error in getDailyReadingData`, error);
-      throw error;
-    }
-  
-    return utils.success(
-      constants.statusCode.Succes,
-      constants.status.SUCCESS,
-      response
-    );
-  };
+   }
 
-function dailySpirometerReadingData(responseData, params) {
-  let result = {};
-  for (let recordData of responseData) {
-
-    let readings = {},
-      totalReading = 0,
-      recordDate;
-    recordDate = moment(recordData.end_time).format("DD MMM YYYY").toString().toUpperCase();
-    const jsonData = JSON.parse(recordData.response_data);
-    if (!jsonData || !jsonData.fvc || jsonData.fvc.length <= 0) {
-      continue
-    }
-    jsonData.fvc.map((data, index) => {
-      if (jsonData.fvc.length && jsonData.fvc.length == index + 1) {
-        totalReading = Number(data.reading);
-      }
-      data.result.attributes.map((attributeObj) => {
-        if (!readings[attributeObj.attribute]) {
-          readings[attributeObj.attribute] = 0
-        }
-        readings[attributeObj.attribute] = Number(attributeObj.value);
-        let findObj = getMatchingRecord(result, attributeObj.attribute, recordData.participantId, recordDate)
-        findObj.total_readings += readings[attributeObj.attribute]
-        findObj.number_of_readings += totalReading;
-
-      });
-    });
-
-  }
-  for (let r in result) {
-    result[r].map(d => { d.mean_reading = Math.round(d.total_readings / d.number_of_readings) })
-  }
-
-  return result;
-};
-  
-  const getMatchingRecord = (result, activityAttribute, participantId, dateTime) => {
-    if (!result[activityAttribute]) {
-      result[activityAttribute] = []
-    }
-    let findObj = result[activityAttribute].find((singleObj) =>
-      singleObj.participant_id === participantId &&
-      singleObj.date === dateTime
-    );
-    if (!findObj) {
-      findObj = {
-        total_readings: 0,
-        participant_id: participantId,
-        date: dateTime,
-        mean_reading: 0,
-        number_of_readings: 0
-      }
-      result[activityAttribute].push(findObj)
-    }
-    return findObj
-  }
-
-module.exports = {
-    getEDROActivities,
-    getRecentData,
-    getEdroActivitiesExpectedData,
-    getDailyReadingData,
-}
+module.exports = EdroDashboardModel;

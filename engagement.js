@@ -1,74 +1,115 @@
-const EngagementModel = require('../models/engagement');
-const {d3, moment} = require('../packages');
-const _ = require('lodash');
-const utils = require('../utils');
+const BaseModel = require("./baseModel");
+const RedshiftModel = require("./redshiftModel");
+const {constants: {DATABASE: {RESEARCH_DB}}} = require('../constants')
+const {convertArrayToString} = require('../utils')
 
-const getPlatformInsight = async (params)=> {
-    const {clientId, siteId, studyId, fromDate, toDate, participantsIds} = params;
-    const engagementModel = new EngagementModel({clientId});
-    const dataDevice = await engagementModel.getDeviceUsage(params)
-    if (dataDevice && dataDevice.length <= 0) {
-      return null;
+
+/**
+ * Class representing a message model.
+ * @class
+ */
+class EngagementModel extends BaseModel {
+    /**
+     * Constructor.
+     *
+     * @param  {Object}  opts
+     */
+    constructor( opts ) {
+        super( opts );
+        this.table = "enrollment";
+        this._hasTimestamps = false;
+        this.clientId = opts.clientId;
     }
-    params.participantsIds = dataDevice.map(row => row.participant_id);
-    const dataPlatform = await engagementModel.getPlatformInsight(params);
-    const mapDevice = {android: 'Android Phone', ios: 'IOS Phone'};
-    let result = {};
-    
-    if (dataPlatform.length > 0) {
-        // aggregate data
-        let datasets = [];
 
-        for(let i=0; i<dataPlatform.length; i++) {
-            datasets.push({
-            ...dataPlatform[i], 
-            ...(dataDevice.find((itmInner) => itmInner.participant_id === dataPlatform[i].participant_id))}
-            );
+    async getDeviceUsage(params){
+        const redshiftModel = new RedshiftModel();
+        const redshiftConnectionPool = await redshiftModel._initRedshiftDbConnectionPool(this.clientId);
+        try {
+            let participantsIds = null;
+            if (params.participantsIds) {
+                participantsIds = convertArrayToString(params.participantsIds);
+            }
+
+            // Redshift Query
+            let redshiftQuery = `SELECT max(device_os)        as device_os,
+            MAX(study_id)         as study_id,
+            MAX(participant_id)   as participant_id,
+            avg(session_duration) as session_duration
+            FROM (SELECT max(lower(device_platform_name))          as device_os,
+                        MAX(a_study_id)                           as study_id,
+                        MAX(a_participant_id)                     as participant_id,
+                        max(session_id)                           as session_id,
+                        DATEDIFF(second,
+                                MIN(event_timestamp),
+                                MAX(CASE
+                                        WHEN event_type = '_session.stop' THEN session_stop_timestamp
+                                        ELSE event_timestamp END)) as session_duration
+                FROM awsma.event
+                WHERE session_id != '00000000-00000000'
+                    and a_participant_id IS NOT NULL
+                    and a_study_id = '${params.studyId}'
+                    and device_platform_name is not null
+                ${params.participantsIds ? ` and a_participant_id IN (${participantsIds}) ` :''}
+                ${params.siteId ? ` and a_site_id = '${params.siteId}' ` :''}
+                ${params.fromDate ? ` and DATE(event_timestamp) between '${params.fromDate}' and '${params.toDate}' ` :''}
+                GROUP BY a_participant_id, session_id) a
+            GROUP BY participant_id;`;
+            console.log(`getDeviceUsage Redshift Query: ${redshiftQuery}`);
+            console.time(`getDeviceUsage Redshift SQL ${JSON.stringify(params)} Ends in:`)
+            const cursor = await redshiftConnectionPool.query(redshiftQuery);
+            console.timeEnd(`getDeviceUsage Redshift SQL ${JSON.stringify(params)} Ends in:`)
+            const data = cursor.rows;
+            redshiftConnectionPool.end();
+            console.log(`Data Redshift Query: ${JSON.stringify(data)}`);
+            
+            return data;
+        } catch (error) {
+            redshiftConnectionPool.end();
+            console.log('Error in function getPlatformInsight-DeviceUsage:', error);
+            throw error;
         }
-        
-        // map object
-        d3.nest()
-            .key(d => d.countryName).sortKeys(d3.ascending)
-            .key(d => d.siteName).sortKeys(d3.ascending)
-            .key(d => d.status).sortKeys(d3.ascending)
-            .key(d => d.device_os).sortKeys(d3.descending)
-            .entries(datasets)
-            .map(v=>{
-            const countryName = v.key;
-            result[countryName] = {};
-            v.values.forEach(bySite=> {
-                const siteName = bySite.key;
-                result[countryName][siteName] = {};
-                bySite.values.forEach(byStatus => {
-                    const statusName = _.capitalize(byStatus.key);
-                    result[countryName][siteName][statusName] = {};
-                    byStatus.values.forEach(byOS=> {
-                        let deviceOS = mapDevice[byOS.key];
-                        if (!deviceOS) {
-                          deviceOS = _.startCase(_.toLower(byOS.key));
-                        }
-                        result[countryName][siteName][statusName][deviceOS] = {};
-                        result[countryName][siteName][statusName][deviceOS].n_devices = byOS.values.length;
-                        let totalDuration = 0;
-                        byOS.values.forEach(val => {
-                            totalDuration += parseInt(val.session_duration);
-                        })
-                        result[countryName][siteName][statusName][deviceOS].avg_session = (totalDuration/byOS.values.length)/60;
-                    })
-                })
-                
-            });
-            delete v.key;
-            delete v.values;
-            return v
-        });
-    } else {
-        result = null;
     }
-  
-    return result
-  }
 
-  module.exports = {
-    getPlatformInsight
-  }
+    async getPlatformInsight(params){
+        const dbConnectionPool = await this._initDbConnectionPool(this.clientId, RESEARCH_DB);
+        try {
+            let participantsIds = null;
+            if (params.participantsIds) {
+                participantsIds = convertArrayToString(params.participantsIds);
+            }
+
+            const bindingParams = [params.studyId];
+            let querySql = `
+            SELECT
+            PSC.study_id,
+            PSC.participant_id, 
+            PSC.country_id,
+            PSC.country_name as countryName,
+            PSC.site_id,
+            PSC.site_name as siteName,
+            IF(P.status = 'ACTIVEWMODIFICATION', 'Active With Modification', P.status) as status
+            FROM research_analytics.participant_site_country PSC
+            LEFT JOIN research.participant P ON PSC.participant_id = P.id
+            WHERE PSC.study_id = ?
+            and P.status IN ('ACTIVE', 'ACTIVEWMODIFICATION', 'INVITED', 'REGISTERED', 'VERIFIED')
+            ${params.participantsIds ? `and PSC.participant_id IN (${participantsIds}) ` : ''} 
+            ${params.siteId ? `and PSC.site_id = '${params.siteId}' ` : ''}
+            GROUP BY participant_id, country_id, site_id, status
+            `;
+            console.time(`getPlatformInsight mySQL SQL ${JSON.stringify(params)} Ends in:`)
+            const [data] = await dbConnectionPool.query(querySql, bindingParams)
+            console.time(`getPlatformInsight mySQL SQL ${JSON.stringify(params)} Ends in:`)
+            console.log(`getPlatformInsight mySQL Query: ${querySql}`);
+            dbConnectionPool.end();
+            console.log(`Data mySQL Query: ${JSON.stringify(data)}`);
+            return data;
+        } catch (error) {
+            dbConnectionPool.end();
+            console.log('Error in function getPlatformInsight:', error);
+            throw error;
+        }
+    }
+    
+}
+
+module.exports = EngagementModel;
